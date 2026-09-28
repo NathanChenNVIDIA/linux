@@ -42,13 +42,34 @@ struct vncr_tlb {
  * memory usage and potential number of different sets of S2 PTs in
  * the guests. Running out of S2 MMUs only affects performance (we
  * will invalidate them more often).
+ *
+ * The default can be overridden with kvm-arm.nested_s2_mmus_per_vcpu=
+ * for hosts whose guests run many concurrent nested VMs per vcpu.
  */
 #define S2_MMU_PER_VCPU		2
+#define S2_MMU_PER_VCPU_MAX	64
+
+static unsigned int s2_mmu_per_vcpu __ro_after_init = S2_MMU_PER_VCPU;
+
+static int __init early_kvm_nested_s2_mmus_per_vcpu_cfg(char *arg)
+{
+	unsigned int val;
+
+	if (!arg || kstrtouint(arg, 0, &val))
+		return -EINVAL;
+
+	if (!val || val > S2_MMU_PER_VCPU_MAX)
+		return -EINVAL;
+
+	s2_mmu_per_vcpu = val;
+	return 0;
+}
+early_param("kvm-arm.nested_s2_mmus_per_vcpu", early_kvm_nested_s2_mmus_per_vcpu_cfg);
 
 int kvm_init_nested(struct kvm *kvm)
 {
 	kvm->arch.nested_mmus = kvmalloc_objs(struct kvm_s2_mmu *,
-					      KVM_MAX_VCPUS * S2_MMU_PER_VCPU,
+					      KVM_MAX_VCPUS * s2_mmu_per_vcpu,
 					      GFP_KERNEL_ACCOUNT);
 	kvm->arch.nested_mmus_size = 0;
 	atomic_set(&kvm->arch.vncr_tlb_count, 0);
@@ -58,7 +79,7 @@ int kvm_init_nested(struct kvm *kvm)
 
 void kvm_destroy_nested(struct kvm *kvm)
 {
-	for (int i = 0; i < kvm->arch.nested_mmus_size; i+= S2_MMU_PER_VCPU)
+	for (int i = 0; i < kvm->arch.nested_mmus_size; i += s2_mmu_per_vcpu)
 		kvfree(kvm->arch.nested_mmus[i]);
 
 	kvm->arch.nested_mmus_size = 0;
@@ -98,17 +119,17 @@ int kvm_vcpu_init_nested(struct kvm_vcpu *vcpu)
 	if (!vcpu->arch.ctxt.vncr_array)
 		return -ENOMEM;
 
-	num_mmus = atomic_read(&kvm->online_vcpus) * S2_MMU_PER_VCPU;
+	num_mmus = atomic_read(&kvm->online_vcpus) * s2_mmu_per_vcpu;
 
 	if (num_mmus > kvm->arch.nested_mmus_size) {
 		struct kvm_s2_mmu *tmp;
 		int i, ret = 0;
 
-		tmp = kvzalloc_objs(*tmp, S2_MMU_PER_VCPU, GFP_KERNEL_ACCOUNT);
+		tmp = kvzalloc_objs(*tmp, s2_mmu_per_vcpu, GFP_KERNEL_ACCOUNT);
 		if (!tmp)
 			ret = -ENOMEM;
 
-		for (i = 0; !ret && i < S2_MMU_PER_VCPU; i++) {
+		for (i = 0; !ret && i < s2_mmu_per_vcpu; i++) {
 			ret = init_nested_s2_mmu(kvm, &tmp[i]);
 			if (ret)
 				break;
@@ -126,10 +147,10 @@ int kvm_vcpu_init_nested(struct kvm_vcpu *vcpu)
 
 		guard(write_lock)(&kvm->mmu_lock);
 
-		for (i = 0; i < S2_MMU_PER_VCPU; i++)
+		for (i = 0; i < s2_mmu_per_vcpu; i++)
 			kvm->arch.nested_mmus[i + kvm->arch.nested_mmus_size] = &tmp[i];
 
-		kvm->arch.nested_mmus_size += S2_MMU_PER_VCPU;
+		kvm->arch.nested_mmus_size += s2_mmu_per_vcpu;
 	}
 
 	return 0;
