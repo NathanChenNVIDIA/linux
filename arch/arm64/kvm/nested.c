@@ -38,19 +38,69 @@ struct vncr_tlb {
 };
 
 /*
- * Ratio of live shadow S2 MMU per vcpu. This is a trade-off between
- * memory usage and potential number of different sets of S2 PTs in
- * the guests. Running out of S2 MMUs only affects performance (we
- * will invalidate them more often).
+ * Initial ratio of shadow S2 MMU per vcpu. When a vcpu has to recycle an
+ * MMU that is still in concurrent use, the pool grows by one MMU per
+ * vcpu, within the host-wide budget below. The pool then follows the
+ * number of different sets of S2 PTs the guest uses at the same time.
  */
 #define S2_MMU_PER_VCPU		2
 
+/*
+ * Each shadow S2 MMU that runs takes a host VMID, and VMIDs are shared
+ * by all VMs on the host. Running out of them causes a rollover, which
+ * invalidates the TLBs for every VM. MMUs added beyond the initial
+ * S2_MMU_PER_VCPU are therefore counted host-wide and limited to half
+ * of the VMID space left once each CPU has its reserved VMID. Hosts
+ * with 8-bit VMIDs don't have enough to spare, so they never grow.
+ */
+static atomic_long_t nested_s2_mmus_grown;
+
+static long nested_s2_mmus_budget(void)
+{
+	if (kvm_arm_vmid_bits <= 8)
+		return 0;
+
+	return max_t(long, 0,
+		     ((long)BIT(kvm_arm_vmid_bits) - num_possible_cpus()) / 2);
+}
+
+/* Lockless hint, checked on recycle before asking for a grow */
+static bool nested_s2_mmus_budget_left(void)
+{
+	return atomic_long_read(&nested_s2_mmus_grown) < nested_s2_mmus_budget();
+}
+
+/* Take up to @nr MMUs from the budget, returning how many were taken */
+static int nested_s2_mmus_budget_take(int nr)
+{
+	long budget = nested_s2_mmus_budget();
+	long old = atomic_long_read(&nested_s2_mmus_grown);
+	long take;
+
+	do {
+		take = min_t(long, nr, budget - old);
+		if (take <= 0)
+			return 0;
+	} while (!atomic_long_try_cmpxchg(&nested_s2_mmus_grown, &old,
+					  old + take));
+
+	return take;
+}
+
+struct nested_s2_mmu_block {
+	struct list_head	list;
+	struct kvm_s2_mmu	mmus[];
+};
+
 int kvm_init_nested(struct kvm *kvm)
 {
+	INIT_LIST_HEAD(&kvm->arch.nested_mmu_blocks);
+	kvm->arch.nested_mmus_capacity = KVM_MAX_VCPUS * S2_MMU_PER_VCPU;
 	kvm->arch.nested_mmus = kvmalloc_objs(struct kvm_s2_mmu *,
-					      KVM_MAX_VCPUS * S2_MMU_PER_VCPU,
+					      kvm->arch.nested_mmus_capacity,
 					      GFP_KERNEL_ACCOUNT);
 	kvm->arch.nested_mmus_size = 0;
+	kvm->arch.nested_mmus_no_grow = !nested_s2_mmus_budget();
 	atomic_set(&kvm->arch.vncr_tlb_count, 0);
 
 	return kvm->arch.nested_mmus ? 0 : -ENOMEM;
@@ -58,9 +108,13 @@ int kvm_init_nested(struct kvm *kvm)
 
 void kvm_destroy_nested(struct kvm *kvm)
 {
-	for (int i = 0; i < kvm->arch.nested_mmus_size; i+= S2_MMU_PER_VCPU)
-		kvfree(kvm->arch.nested_mmus[i]);
+	struct nested_s2_mmu_block *blk, *tmp;
 
+	list_for_each_entry_safe(blk, tmp, &kvm->arch.nested_mmu_blocks, list)
+		kvfree(blk);
+
+	atomic_long_sub(kvm->arch.nested_mmus_grown, &nested_s2_mmus_grown);
+	kvm->arch.nested_mmus_grown = 0;
 	kvm->arch.nested_mmus_size = 0;
 	kvfree(kvm->arch.nested_mmus);
 }
@@ -78,6 +132,106 @@ static int init_nested_s2_mmu(struct kvm *kvm, struct kvm_s2_mmu *mmu)
 	 * wants to its own guests as it would be on real HW.
 	 */
 	return kvm_init_stage2_mmu(kvm, mmu, kvm_get_pa_bits(kvm));
+}
+
+/*
+ * Add @nr shadow S2 MMUs to the pool, reallocating the pointer table if
+ * it is full. Only the table moves, never the MMUs, so cached hw_mmu
+ * pointers stay valid. Runtime walkers of the table hold mmu_lock, and
+ * kvm_arch_flush_shadow_all() only runs once no vcpu can enter the
+ * guest, so it can't race with a grow.
+ */
+static int kvm_nested_add_s2_mmus(struct kvm *kvm, int nr, bool grow)
+{
+	gfp_t gfp = GFP_KERNEL_ACCOUNT | (grow ? __GFP_NORETRY : 0);
+	size_t size = kvm->arch.nested_mmus_size;
+	size_t cap = kvm->arch.nested_mmus_capacity;
+	struct kvm_s2_mmu **table = NULL;
+	struct nested_s2_mmu_block *blk;
+	int i, ret = 0;
+
+	lockdep_assert_held(&kvm->arch.config_lock);
+
+	blk = kvzalloc_flex(*blk, mmus, nr, gfp);
+	if (!blk)
+		return -ENOMEM;
+
+	for (i = 0; i < nr; i++) {
+		ret = init_nested_s2_mmu(kvm, &blk->mmus[i]);
+		if (ret)
+			goto out_free;
+	}
+
+	if (size + nr > cap) {
+		cap = max(cap * 2, size + nr);
+		table = kvmalloc_objs(struct kvm_s2_mmu *, cap, gfp);
+		if (!table) {
+			ret = -ENOMEM;
+			goto out_free;
+		}
+	}
+
+	scoped_guard(write_lock, &kvm->mmu_lock) {
+		if (table) {
+			memcpy(table, kvm->arch.nested_mmus,
+			       size_mul(size, sizeof(*table)));
+			swap(kvm->arch.nested_mmus, table);
+			kvm->arch.nested_mmus_capacity = cap;
+		}
+
+		for (i = 0; i < nr; i++)
+			kvm->arch.nested_mmus[size + i] = &blk->mmus[i];
+
+		kvm->arch.nested_mmus_size = size + nr;
+
+		/* Hand out the new, unused MMUs before recycling live ones */
+		kvm->arch.nested_mmus_next = size;
+		WRITE_ONCE(kvm->arch.nested_mmus_grow, false);
+	}
+
+	list_add(&blk->list, &kvm->arch.nested_mmu_blocks);
+	kvfree(table);
+
+	return 0;
+
+out_free:
+	while (i--)
+		kvm_free_stage2_pgd(&blk->mmus[i]);
+
+	kvfree(blk);
+	return ret;
+}
+
+/*
+ * A vcpu had to recycle a shadow S2 MMU in concurrent use: grow the pool
+ * by one MMU per vcpu, within the budget. If the budget is used up, the
+ * pool keeps recycling until another VM's destruction returns some.
+ * Stop growing for good if an allocation fails, so that a VM at its
+ * memory limit doesn't retry on every recycle. The pool never shrinks:
+ * it keeps the peak number of stage-2 contexts in concurrent use.
+ */
+static void kvm_nested_s2_grow(struct kvm *kvm)
+{
+	int nr;
+
+	guard(mutex)(&kvm->arch.config_lock);
+
+	if (!READ_ONCE(kvm->arch.nested_mmus_grow))
+		return;
+
+	nr = nested_s2_mmus_budget_take(atomic_read(&kvm->online_vcpus));
+	if (!nr) {
+		WRITE_ONCE(kvm->arch.nested_mmus_grow, false);
+		return;
+	}
+
+	if (kvm_nested_add_s2_mmus(kvm, nr, true)) {
+		atomic_long_sub(nr, &nested_s2_mmus_grown);
+		WRITE_ONCE(kvm->arch.nested_mmus_no_grow, true);
+		return;
+	}
+
+	kvm->arch.nested_mmus_grown += nr;
 }
 
 int kvm_vcpu_init_nested(struct kvm_vcpu *vcpu)
@@ -101,35 +255,13 @@ int kvm_vcpu_init_nested(struct kvm_vcpu *vcpu)
 	num_mmus = atomic_read(&kvm->online_vcpus) * S2_MMU_PER_VCPU;
 
 	if (num_mmus > kvm->arch.nested_mmus_size) {
-		struct kvm_s2_mmu *tmp;
-		int i, ret = 0;
-
-		tmp = kvzalloc_objs(*tmp, S2_MMU_PER_VCPU, GFP_KERNEL_ACCOUNT);
-		if (!tmp)
-			ret = -ENOMEM;
-
-		for (i = 0; !ret && i < S2_MMU_PER_VCPU; i++) {
-			ret = init_nested_s2_mmu(kvm, &tmp[i]);
-			if (ret)
-				break;
-		}
+		int ret = kvm_nested_add_s2_mmus(kvm, S2_MMU_PER_VCPU, false);
 
 		if (ret) {
-			while (--i >= 0)
-				kvm_free_stage2_pgd(&tmp[i]);
-
-			kvfree(tmp);
 			free_page((unsigned long)vcpu->arch.ctxt.vncr_array);
 			vcpu->arch.ctxt.vncr_array = NULL;
 			return ret;
 		}
-
-		guard(write_lock)(&kvm->mmu_lock);
-
-		for (i = 0; i < S2_MMU_PER_VCPU; i++)
-			kvm->arch.nested_mmus[i + kvm->arch.nested_mmus_size] = &tmp[i];
-
-		kvm->arch.nested_mmus_size += S2_MMU_PER_VCPU;
 	}
 
 	return 0;
@@ -810,7 +942,8 @@ static struct kvm_s2_mmu *get_s2_mmu_nested(struct kvm_vcpu *vcpu)
 {
 	struct kvm *kvm = vcpu->kvm;
 	struct kvm_s2_mmu *s2_mmu;
-	int i;
+	bool in_use = true;
+	int i, victim = -1;
 
 	lockdep_assert_held_write(&vcpu->kvm->mmu_lock);
 
@@ -822,24 +955,51 @@ static struct kvm_s2_mmu *get_s2_mmu_nested(struct kvm_vcpu *vcpu)
 	 * Make sure we don't always search from the same point, or we
 	 * will always reuse a potentially active context, leaving
 	 * free contexts unused.
+	 *
+	 * Pick the victim with a clock: a free MMU that is invalid, or
+	 * hasn't been used since the search last went past it (such as
+	 * one left behind by a torn down guest), is recycled straight
+	 * away. Other free MMUs lose their accessed bit and get a second
+	 * chance. If every free MMU was used since the last pass, they
+	 * are all in concurrent use and the pool is too small.
 	 */
 	for (i = kvm->arch.nested_mmus_next;
 	     i < (kvm->arch.nested_mmus_size + kvm->arch.nested_mmus_next);
 	     i++) {
-		s2_mmu = kvm->arch.nested_mmus[i % kvm->arch.nested_mmus_size];
+		struct kvm_s2_mmu *mmu;
 
-		if (atomic_read(&s2_mmu->refcnt) == 0)
+		mmu = kvm->arch.nested_mmus[i % kvm->arch.nested_mmus_size];
+		if (atomic_read(&mmu->refcnt))
+			continue;
+
+		if (!kvm_s2_mmu_valid(mmu) || !mmu->accessed) {
+			victim = i;
+			in_use = false;
 			break;
+		}
+
+		if (victim < 0)
+			victim = i;
+
+		mmu->accessed = false;
 	}
-	BUG_ON(atomic_read(&s2_mmu->refcnt)); /* We have struct MMUs to spare */
+	BUG_ON(victim < 0); /* We have struct MMUs to spare */
+	s2_mmu = kvm->arch.nested_mmus[victim % kvm->arch.nested_mmus_size];
 
 	/* Set the scene for the next search */
-	kvm->arch.nested_mmus_next = (i + 1) % kvm->arch.nested_mmus_size;
+	kvm->arch.nested_mmus_next = (victim + 1) % kvm->arch.nested_mmus_size;
 
 	/* Make sure we don't forget to do the laundry */
 	if (kvm_s2_mmu_valid(s2_mmu)) {
 		kvm_nested_s2_ptdump_remove_debugfs(s2_mmu);
 		s2_mmu->pending_unmap = true;
+	}
+
+	/* Every free MMU is in concurrent use: the pool is too small */
+	if (in_use && !READ_ONCE(kvm->arch.nested_mmus_no_grow) &&
+	    nested_s2_mmus_budget_left()) {
+		WRITE_ONCE(kvm->arch.nested_mmus_grow, true);
+		kvm_make_request(KVM_REQ_NESTED_S2_GROW, vcpu);
 	}
 
 	/*
@@ -858,6 +1018,7 @@ static struct kvm_s2_mmu *get_s2_mmu_nested(struct kvm_vcpu *vcpu)
 
 out:
 	atomic_inc(&s2_mmu->refcnt);
+	s2_mmu->accessed = true;
 
 	/*
 	 * Set the vCPU request to perform an unmap, even if the pending unmap
@@ -2030,6 +2191,9 @@ void check_nested_vcpu_requests(struct kvm_vcpu *vcpu)
 		}
 		write_unlock(&vcpu->kvm->mmu_lock);
 	}
+
+	if (kvm_check_request(KVM_REQ_NESTED_S2_GROW, vcpu))
+		kvm_nested_s2_grow(vcpu->kvm);
 
 	if (kvm_check_request(KVM_REQ_MAP_L1_VNCR_EL2, vcpu))
 		kvm_map_l1_vncr(vcpu);
