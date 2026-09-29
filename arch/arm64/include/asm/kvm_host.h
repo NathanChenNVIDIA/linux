@@ -55,6 +55,7 @@
 #define KVM_REQ_GUEST_HYP_IRQ_PENDING	KVM_ARCH_REQ(9)
 #define KVM_REQ_MAP_L1_VNCR_EL2		KVM_ARCH_REQ(10)
 #define KVM_REQ_VGIC_PROCESS_UPDATE	KVM_ARCH_REQ(11)
+#define KVM_REQ_NESTED_S2_GROW		KVM_ARCH_REQ(12)
 
 #define KVM_DIRTY_LOG_MANUAL_CAPS   (KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE | \
 				     KVM_DIRTY_LOG_INITIALLY_SET)
@@ -227,6 +228,9 @@ struct kvm_s2_mmu {
 	 */
 	bool	pending_unmap;
 
+	/* Used since the victim search last went past it, under mmu_lock */
+	bool	accessed;
+
 	/*
 	 *  0: Nobody is currently using this, check vttbr for validity
 	 * >0: Somebody is actively using this.
@@ -320,11 +324,16 @@ struct kvm_arch {
 
 	/*
 	 * Stage 2 paging state for VMs with nested S2 using a virtual
-	 * VMID.
+	 * VMID. The MMUs are allocated in blocks tracked on
+	 * nested_mmu_blocks, and the pool grows on demand.
 	 */
 	struct kvm_s2_mmu **nested_mmus;
 	size_t nested_mmus_size;
+	size_t nested_mmus_capacity;
+	struct list_head nested_mmu_blocks;
 	int nested_mmus_next;
+	bool nested_mmus_grow;
+	bool nested_mmus_no_grow;
 
 	/* Interrupt controller */
 	struct vgic_dist	vgic;
