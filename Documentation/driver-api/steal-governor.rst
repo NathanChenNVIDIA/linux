@@ -113,6 +113,21 @@ This determines what values should be considered as high steal values.
 When steal governor sees steal ratio is higher than this value, it will
 reduce the preferred CPUs by 1 core.
 
+relax_ms
+--------
+
+When non-zero, a decrease also caps the preferred CPUs at the new count.
+The cap is raised by one CPU after each relax_ms of steal ratio at or below
+low_threshold, and any interval above low_threshold restarts that wait.
+Default: 0, i.e. no cap.
+
+Reducing preferred CPUs removes the contention that caused the steal, so
+steal drops right after a decrease. Without a cap, the governor then adds
+the CPUs back at the rate it removed them and recreates the contention.
+The cap keeps it from growing back to the size at which steal last went
+above high_threshold, while still letting it regrow slowly once the load
+goes away.
+
 Limitations of default values
 -----------------------------
 

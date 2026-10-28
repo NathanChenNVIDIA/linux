@@ -42,6 +42,9 @@ struct steal_governor {
 	unsigned int		interval_ms;
 	unsigned int		high_threshold;
 	unsigned int		low_threshold;
+	unsigned int		relax_ms;
+	unsigned int		ceiling;
+	ktime_t			relax_at;
 	struct delayed_work	work;
 };
 
@@ -49,6 +52,7 @@ static struct steal_governor sg_ctx = {
 	.interval_ms	=	1000,	/* 1 second */
 	.high_threshold =	500,	/* 5% */
 	.low_threshold	=	200,	/* 2% */
+	.ceiling	=	UINT_MAX,
 };
 
 static void restore_preferred_to_active(void)
@@ -115,6 +119,10 @@ MODULE_PARM_DESC(high_threshold,
 module_param_named(low_threshold, sg_ctx.low_threshold, uint, 0444);
 MODULE_PARM_DESC(low_threshold,
 		 "Low steal threshold. default: 200 i.e 2%. Must be < high_threshold");
+
+module_param_named(relax_ms, sg_ctx.relax_ms, uint, 0444);
+MODULE_PARM_DESC(relax_ms,
+		 "Cap preferred CPUs at the count after the last decrease, raising the cap by one CPU per relax_ms of low steal. default: 0 (no cap)");
 
 /* Return collective steal time across system. */
 static u64 get_system_steal_time(void)
@@ -238,10 +246,22 @@ static void steal_governor_loop(struct work_struct *work)
 	delta_ns = max_t(u64, div_u64(delta_ns * get_system_cpus(), 10000), 1);
 	steal_ratio = div64_u64(delta_steal, delta_ns);
 
-	if (steal_ratio > sg_ctx.high_threshold)
+	if (steal_ratio > sg_ctx.high_threshold) {
 		decrease_preferred_cpus();
-	else if (steal_ratio <= sg_ctx.low_threshold)
-		increase_preferred_cpus();
+		sg_ctx.relax_at = ktime_add_ms(now, sg_ctx.relax_ms);
+		if (sg_ctx.relax_ms)
+			sg_ctx.ceiling = cpumask_weight(cpu_preferred_mask);
+	} else if (steal_ratio <= sg_ctx.low_threshold) {
+		if (sg_ctx.relax_ms && sg_ctx.ceiling < UINT_MAX &&
+		    ktime_after(now, sg_ctx.relax_at)) {
+			sg_ctx.ceiling++;
+			sg_ctx.relax_at = ktime_add_ms(now, sg_ctx.relax_ms);
+		}
+		if (cpumask_weight(cpu_preferred_mask) < sg_ctx.ceiling)
+			increase_preferred_cpus();
+	} else {
+		sg_ctx.relax_at = ktime_add_ms(now, sg_ctx.relax_ms);
+	}
 	/*
 	 * else: steal ratio is within bounds. Still do design checks so that
 	 * module restores to active if CPU hotplug breaks those assumptions.
@@ -275,8 +295,9 @@ static int __init steal_governor_init(void)
 	sg_ctx.steal = get_system_steal_time();
 	sg_ctx.time = ktime_get();
 	schedule_delayed_work(&sg_ctx.work, sg_ctx.delay);
-	pr_info("enabled. interval: %ums, high_threshold: %u, low_threshold: %u\n",
-		sg_ctx.interval_ms, sg_ctx.high_threshold, sg_ctx.low_threshold);
+	pr_info("enabled. interval: %ums, high_threshold: %u, low_threshold: %u, relax: %ums\n",
+		sg_ctx.interval_ms, sg_ctx.high_threshold, sg_ctx.low_threshold,
+		sg_ctx.relax_ms);
 
 	return 0;
 }
