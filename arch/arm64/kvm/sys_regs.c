@@ -4045,6 +4045,7 @@ static bool handle_alle1is(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
 	 * corresponding VMIDs.
 	 */
 	kvm_nested_s2_unmap(vcpu->kvm, true);
+	kvm_nested_s2_shrink(vcpu->kvm);
 
 	write_unlock(&vcpu->kvm->mmu_lock);
 

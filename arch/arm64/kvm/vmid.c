@@ -129,6 +129,18 @@ set_vmid:
 	return vmid;
 }
 
+/*
+ * Number of VMIDs that can be handed out within a generation: VMID #0
+ * is never allocated, and a rollover can keep one VMID reserved per CPU.
+ */
+unsigned int kvm_arm_vmid_nr_usable(void)
+{
+	if (NUM_USER_VMIDS - 1 <= num_possible_cpus())
+		return 0;
+
+	return NUM_USER_VMIDS - 1 - num_possible_cpus();
+}
+
 /* Called from vCPU sched out with preemption disabled */
 void kvm_arm_vmid_clear_active(void)
 {
