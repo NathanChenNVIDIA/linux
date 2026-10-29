@@ -47,8 +47,14 @@ struct vncr_tlb {
 #define S2_MMU_PER_VCPU		2
 #define S2_MMU_PER_VM		(KVM_MAX_VCPUS * S2_MMU_PER_VCPU)
 
+struct nested_s2_mmu_block {
+	struct list_head	list;
+	struct kvm_s2_mmu	mmus[];
+};
+
 int kvm_init_nested(struct kvm *kvm)
 {
+	INIT_LIST_HEAD(&kvm->arch.nested_mmu_blocks);
 	kvm->arch.nested_mmus = kvmalloc_objs(struct kvm_s2_mmu *,
 					      S2_MMU_PER_VM,
 					      GFP_KERNEL_ACCOUNT);
@@ -61,8 +67,10 @@ int kvm_init_nested(struct kvm *kvm)
 
 void kvm_destroy_nested(struct kvm *kvm)
 {
-	for (int i = 0; i < kvm->arch.nested_mmus_size; i+= S2_MMU_PER_VCPU)
-		kvfree(kvm->arch.nested_mmus[i]);
+	struct nested_s2_mmu_block *blk, *tmp;
+
+	list_for_each_entry_safe(blk, tmp, &kvm->arch.nested_mmu_blocks, list)
+		kvfree(blk);
 
 	kvm->arch.nested_mmus_size = 0;
 	kvfree(kvm->arch.nested_mmus);
@@ -81,6 +89,49 @@ static int init_nested_s2_mmu(struct kvm *kvm, struct kvm_s2_mmu *mmu)
 	 * wants to its own guests as it would be on real HW.
 	 */
 	return kvm_init_stage2_mmu(kvm, mmu, kvm_get_pa_bits(kvm));
+}
+
+/* Add a block of @nr shadow S2 MMUs to the pool */
+static int kvm_nested_add_s2_mmus(struct kvm *kvm, int nr)
+{
+	size_t size = kvm->arch.nested_mmus_size;
+	struct nested_s2_mmu_block *blk;
+	int i, ret = 0;
+
+	lockdep_assert_held(&kvm->arch.config_lock);
+
+	blk = kvzalloc_flex(*blk, mmus, nr, GFP_KERNEL_ACCOUNT);
+	if (!blk)
+		return -ENOMEM;
+
+	for (i = 0; i < nr; i++) {
+		ret = init_nested_s2_mmu(kvm, &blk->mmus[i]);
+		if (ret)
+			goto out_free;
+
+		blk->mmus[i].s2_mmu_idx = size + i;
+	}
+
+	scoped_guard(write_lock, &kvm->mmu_lock) {
+		for (i = 0; i < nr; i++)
+			kvm->arch.nested_mmus[size + i] = &blk->mmus[i];
+
+		kvm->arch.nested_mmus_size = size + nr;
+	}
+
+	list_add(&blk->list, &kvm->arch.nested_mmu_blocks);
+
+	for (i = 0; i < nr; i++)
+		kvm_nested_s2_ptdump_create_debugfs(&blk->mmus[i], size + i);
+
+	return 0;
+
+out_free:
+	while (i--)
+		kvm_free_stage2_pgd(&blk->mmus[i]);
+
+	kvfree(blk);
+	return ret;
 }
 
 int kvm_vcpu_init_nested(struct kvm_vcpu *vcpu)
@@ -104,40 +155,13 @@ int kvm_vcpu_init_nested(struct kvm_vcpu *vcpu)
 	num_mmus = atomic_read(&kvm->online_vcpus) * S2_MMU_PER_VCPU;
 
 	if (num_mmus > kvm->arch.nested_mmus_size) {
-		struct kvm_s2_mmu *tmp;
-		int i, ret = 0;
-
-		tmp = kvzalloc_objs(*tmp, S2_MMU_PER_VCPU, GFP_KERNEL_ACCOUNT);
-		if (!tmp)
-			ret = -ENOMEM;
-
-		for (i = 0; !ret && i < S2_MMU_PER_VCPU; i++) {
-			ret = init_nested_s2_mmu(kvm, &tmp[i]);
-			if (ret)
-				break;
-		}
+		int ret = kvm_nested_add_s2_mmus(kvm, S2_MMU_PER_VCPU);
 
 		if (ret) {
-			while (--i >= 0)
-				kvm_free_stage2_pgd(&tmp[i]);
-
-			kvfree(tmp);
 			free_page((unsigned long)vcpu->arch.ctxt.vncr_array);
 			vcpu->arch.ctxt.vncr_array = NULL;
 			return ret;
 		}
-
-		for (i = 0; i < S2_MMU_PER_VCPU; i++)
-			kvm_nested_s2_ptdump_create_debugfs(&tmp[i], i + kvm->arch.nested_mmus_size);
-
-		guard(write_lock)(&kvm->mmu_lock);
-
-		for (i = 0; i < S2_MMU_PER_VCPU; i++) {
-			tmp[i].s2_mmu_idx = i + kvm->arch.nested_mmus_size;
-			kvm->arch.nested_mmus[i + kvm->arch.nested_mmus_size] = &tmp[i];
-		}
-
-		kvm->arch.nested_mmus_size += S2_MMU_PER_VCPU;
 	}
 
 	return 0;

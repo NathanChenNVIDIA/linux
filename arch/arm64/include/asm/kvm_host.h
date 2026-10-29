@@ -425,10 +425,12 @@ struct kvm_arch {
 
 	/*
 	 * Stage 2 paging state for VMs with nested S2 using a virtual
-	 * VMID.
+	 * VMID. The MMUs are allocated in blocks tracked on
+	 * nested_mmu_blocks.
 	 */
 	struct kvm_s2_mmu **nested_mmus;
 	size_t nested_mmus_size;
+	struct list_head nested_mmu_blocks;
 	int nested_mmus_next;
 
 	/*
