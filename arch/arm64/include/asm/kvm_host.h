@@ -320,6 +320,9 @@ struct kvm_s2_mmu {
 	/* Index in the S2 MMU array, only valid for a shadow S2 */
 	u16	s2_mmu_idx;
 
+	/* Used since the victim search last went past it, under mmu_lock */
+	bool	accessed;
+
 	/*
 	 *  0: Nobody is currently using this, check vttbr for validity
 	 * >0: Somebody is actively using this.

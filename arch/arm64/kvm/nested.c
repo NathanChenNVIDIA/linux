@@ -842,7 +842,7 @@ static struct kvm_s2_mmu *get_s2_mmu_nested(struct kvm_vcpu *vcpu)
 {
 	struct kvm *kvm = vcpu->kvm;
 	struct kvm_s2_mmu *s2_mmu;
-	int i;
+	int i, victim = -1;
 
 	lockdep_assert_held_write(&vcpu->kvm->mmu_lock);
 
@@ -854,19 +854,38 @@ static struct kvm_s2_mmu *get_s2_mmu_nested(struct kvm_vcpu *vcpu)
 	 * Make sure we don't always search from the same point, or we
 	 * will always reuse a potentially active context, leaving
 	 * free contexts unused.
+	 *
+	 * Pick the victim with a clock: a free MMU that is invalid, or
+	 * hasn't been used since the search last went past it (such as
+	 * one left behind by a torn down guest), is recycled straight
+	 * away. Other free MMUs lose their accessed bit and get a second
+	 * chance. If every free MMU was used since the last pass, the
+	 * first one found is recycled.
 	 */
 	for (i = kvm->arch.nested_mmus_next;
 	     i < (kvm->arch.nested_mmus_size + kvm->arch.nested_mmus_next);
 	     i++) {
-		s2_mmu = kvm->arch.nested_mmus[i % kvm->arch.nested_mmus_size];
+		struct kvm_s2_mmu *mmu;
 
-		if (atomic_read(&s2_mmu->refcnt) == 0)
+		mmu = kvm->arch.nested_mmus[i % kvm->arch.nested_mmus_size];
+		if (atomic_read(&mmu->refcnt))
+			continue;
+
+		if (!kvm_s2_mmu_valid(mmu) || !mmu->accessed) {
+			victim = i;
 			break;
+		}
+
+		if (victim < 0)
+			victim = i;
+
+		mmu->accessed = false;
 	}
-	BUG_ON(atomic_read(&s2_mmu->refcnt)); /* We have struct MMUs to spare */
+	BUG_ON(victim < 0); /* We have struct MMUs to spare */
+	s2_mmu = kvm->arch.nested_mmus[victim % kvm->arch.nested_mmus_size];
 
 	/* Set the scene for the next search */
-	kvm->arch.nested_mmus_next = (i + 1) % kvm->arch.nested_mmus_size;
+	kvm->arch.nested_mmus_next = (victim + 1) % kvm->arch.nested_mmus_size;
 
 	/* Make sure we don't forget to do the laundry */
 	if (kvm_s2_mmu_valid(s2_mmu))
@@ -886,6 +905,7 @@ static struct kvm_s2_mmu *get_s2_mmu_nested(struct kvm_vcpu *vcpu)
 
 out:
 	atomic_inc(&s2_mmu->refcnt);
+	s2_mmu->accessed = true;
 
 	/*
 	 * Set the vCPU request to perform an unmap, even if the pending unmap
