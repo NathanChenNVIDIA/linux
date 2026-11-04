@@ -175,6 +175,7 @@ extern void kvm_nested_unmap_cipa_range(struct kvm *kvm, gpa_t cipa,
 					size_t unmap_size, bool may_block);
 extern void kvm_nested_s2_unmap(struct kvm *kvm, bool may_block);
 extern void kvm_nested_s2_shrink(struct kvm *kvm);
+extern bool kvm_nested_s2_park(struct kvm *kvm, struct kvm_s2_mmu *mmu);
 extern void kvm_nested_s2_flush(struct kvm *kvm);
 
 unsigned long compute_tlb_inval_range(struct kvm_s2_mmu *mmu, u64 val);
