@@ -4121,6 +4121,14 @@ static void s2_mmu_unmap_range(struct kvm_s2_mmu *mmu,
 	 * the TLBI.
 	 */
 	kvm_stage2_unmap_range(mmu, info->range.start, info->range.size, true);
+
+	/*
+	 * The guest hypervisor may have unmapped everything this MMU held,
+	 * e.g. all memory of a nested VM being torn down. If it is grown and
+	 * now empty, return it to the budget rather than leave it for a
+	 * recycle to unmap again.
+	 */
+	kvm_nested_s2_park(kvm_s2_mmu_to_kvm(mmu), mmu);
 }
 
 static bool handle_vmalls12e1is(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
