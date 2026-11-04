@@ -121,7 +121,7 @@ static bool kvm_s2_mmu_empty(struct kvm_s2_mmu *mmu)
  * mmu_lock never see it go away. Parking always leaves S2_MMU_PER_VCPU
  * unparked MMUs per vcpu, so the victim search always has a candidate.
  */
-static bool kvm_nested_s2_park(struct kvm *kvm, struct kvm_s2_mmu *mmu)
+bool kvm_nested_s2_park(struct kvm *kvm, struct kvm_s2_mmu *mmu)
 {
 	unsigned int keep = atomic_read(&kvm->online_vcpus) * S2_MMU_PER_VCPU;
 
