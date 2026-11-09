@@ -59,6 +59,7 @@
 #define KVM_REQ_MAP_L1_VNCR_EL2		KVM_ARCH_REQ(10)
 #define KVM_REQ_VGIC_PROCESS_UPDATE	KVM_ARCH_REQ(11)
 #define KVM_REQ_RELOAD_GICv5		KVM_ARCH_REQ(12)
+#define KVM_REQ_NESTED_S2_GROW		KVM_ARCH_REQ(13)
 
 /* Bit indices for kvm_arch::flags */
 enum {
@@ -429,12 +430,17 @@ struct kvm_arch {
 	/*
 	 * Stage 2 paging state for VMs with nested S2 using a virtual
 	 * VMID. The MMUs are allocated in blocks tracked on
-	 * nested_mmu_blocks.
+	 * nested_mmu_blocks, and the pool grows on demand.
 	 */
 	struct kvm_s2_mmu **nested_mmus;
 	size_t nested_mmus_size;
+	size_t nested_mmus_capacity;
 	struct list_head nested_mmu_blocks;
+	/* Grown MMUs, counted in the host budget, under mmu_lock */
+	unsigned int nested_mmus_grown;
 	int nested_mmus_next;
+	bool nested_mmus_grow;
+	bool nested_mmus_no_grow;
 
 	/*
 	 * Serializes guest s2 tracking trees access when the mmu_lock
