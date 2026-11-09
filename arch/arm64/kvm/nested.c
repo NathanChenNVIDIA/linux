@@ -96,6 +96,55 @@ struct nested_s2_mmu_block {
 	struct kvm_s2_mmu	mmus[];
 };
 
+static int s2_mmu_nonempty_walker(const struct kvm_pgtable_visit_ctx *ctx,
+				  enum kvm_pgtable_walk_flags visit)
+{
+	return ctx->old ? -EEXIST : 0;
+}
+
+/* Only looks at the stage-2 root unless it finds an entry in use */
+static bool kvm_s2_mmu_empty(struct kvm_s2_mmu *mmu)
+{
+	struct kvm_pgtable_walker walker = {
+		.cb	= s2_mmu_nonempty_walker,
+		.flags	= KVM_PGTABLE_WALK_LEAF | KVM_PGTABLE_WALK_TABLE_PRE,
+	};
+
+	return !kvm_pgtable_walk(mmu->pgt, 0, kvm_phys_size(mmu), &walker);
+}
+
+/*
+ * Park @mmu if it is grown, unreferenced and empty, returning it to the
+ * budget. It is invalidated, so no lookup can hand it out, and skipped
+ * by the victim search. It keeps its slot, its struct and its stage-2
+ * root until the VM is destroyed, so walkers of the table that drop
+ * mmu_lock never see it go away. Parking always leaves S2_MMU_PER_VCPU
+ * unparked MMUs per vcpu, so the victim search always has a candidate.
+ */
+static bool kvm_nested_s2_park(struct kvm *kvm, struct kvm_s2_mmu *mmu)
+{
+	unsigned int keep = atomic_read(&kvm->online_vcpus) * S2_MMU_PER_VCPU;
+
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
+	if (kvm->arch.nested_mmus_size - kvm->arch.nested_mmus_parked <= keep)
+		return false;
+
+	if (!mmu->grown || mmu->parked || atomic_read(&mmu->refcnt) ||
+	    !mmu->pgt || !kvm_s2_mmu_empty(mmu))
+		return false;
+
+	if (kvm_s2_mmu_valid(mmu))
+		kvm_init_nested_s2_mmu(mmu);
+	mmu->parked = true;
+	mmu->pending_unmap = false;
+
+	kvm->arch.nested_mmus_grown--;
+	kvm->arch.nested_mmus_parked++;
+	atomic_dec(&nested_s2_mmus_grown);
+	return true;
+}
+
 int kvm_init_nested(struct kvm *kvm)
 {
 	INIT_LIST_HEAD(&kvm->arch.nested_mmu_blocks);
@@ -167,6 +216,7 @@ static int kvm_nested_add_s2_mmus(struct kvm *kvm, int nr, bool grow)
 			goto out_free;
 
 		blk->mmus[i].s2_mmu_idx = size + i;
+		blk->mmus[i].grown = grow;
 	}
 
 	if (size + nr > cap) {
@@ -216,14 +266,15 @@ out_free:
 /*
  * A vcpu had to recycle a shadow S2 MMU in concurrent use. The request
  * is per vcpu, but the pool belongs to the VM: grow it by one MMU per
- * vcpu, within the budget and S2_MMU_MAX_PER_VM. If the budget is used
- * up, the pool keeps recycling until another VM's destruction returns
+ * vcpu, within the budget and S2_MMU_MAX_PER_VM, reactivating parked
+ * MMUs before allocating new ones. If the budget is used up, the pool
+ * keeps recycling until parking or another VM's destruction returns
  * some. Stop growing for good if an allocation fails, so that a VM at
  * its memory limit doesn't retry on every recycle.
  */
 static void kvm_nested_s2_grow(struct kvm *kvm)
 {
-	int nr, add;
+	int nr, add = 0, reactivated = 0, first = -1;
 
 	guard(mutex)(&kvm->arch.config_lock);
 
@@ -238,15 +289,57 @@ static void kvm_nested_s2_grow(struct kvm *kvm)
 		return;
 	}
 
-	add = min_t(int, nr, S2_MMU_MAX_PER_VM - kvm->arch.nested_mmus_size);
+	scoped_guard(write_lock, &kvm->mmu_lock) {
+		for (int i = 0; i < kvm->arch.nested_mmus_size; i++) {
+			struct kvm_s2_mmu *mmu = kvm->arch.nested_mmus[i];
+
+			if (reactivated == nr)
+				break;
+			if (!mmu->parked)
+				continue;
+
+			mmu->parked = false;
+			reactivated++;
+			if (first < 0)
+				first = i;
+		}
+
+		if (reactivated) {
+			kvm->arch.nested_mmus_grown += reactivated;
+			kvm->arch.nested_mmus_parked -= reactivated;
+			kvm->arch.nested_mmus_next = first;
+		}
+
+		add = min_t(int, nr - reactivated,
+			    S2_MMU_MAX_PER_VM - kvm->arch.nested_mmus_size);
+	}
+
 	if (add && kvm_nested_add_s2_mmus(kvm, add, true)) {
 		WRITE_ONCE(kvm->arch.nested_mmus_no_grow, true);
 		add = 0;
 	}
 	WRITE_ONCE(kvm->arch.nested_mmus_grow, false);
 
-	if (nr - add)
-		atomic_sub(nr - add, &nested_s2_mmus_grown);
+	if (nr - reactivated - add)
+		atomic_sub(nr - reactivated - add, &nested_s2_mmus_grown);
+}
+
+/*
+ * The guest hypervisor invalidated all of its stage-2 TLBs, and the
+ * caller has just unmapped every shadow S2 MMU. Any MMU of a torn down
+ * nested VM is now empty and unreferenced, but so may be those of live
+ * nested VMs that aren't running right now. Park every grown MMU that
+ * is unreferenced and still empty. Parking doesn't unmap or invalidate
+ * TLBs again, as every removal of its mappings was followed by a TLB
+ * invalidation. An MMU that was refilled since the caller's unmap is in
+ * use, and is left alone.
+ */
+void kvm_nested_s2_shrink(struct kvm *kvm)
+{
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
+	for (int i = 0; i < kvm->arch.nested_mmus_size; i++)
+		kvm_nested_s2_park(kvm, kvm->arch.nested_mmus[i]);
 }
 
 int kvm_vcpu_init_nested(struct kvm_vcpu *vcpu)
@@ -976,7 +1069,8 @@ static struct kvm_s2_mmu *get_s2_mmu_nested(struct kvm_vcpu *vcpu)
 	 * one left behind by a torn down guest), is recycled straight
 	 * away. Other free MMUs lose their accessed bit and get a second
 	 * chance. If every free MMU was used since the last pass, they
-	 * are all in concurrent use and the pool is too small.
+	 * are all in concurrent use and the pool is too small. Parked
+	 * MMUs are skipped until a grow reactivates them.
 	 */
 	for (i = kvm->arch.nested_mmus_next;
 	     i < (kvm->arch.nested_mmus_size + kvm->arch.nested_mmus_next);
@@ -984,7 +1078,7 @@ static struct kvm_s2_mmu *get_s2_mmu_nested(struct kvm_vcpu *vcpu)
 		struct kvm_s2_mmu *mmu;
 
 		mmu = kvm->arch.nested_mmus[i % kvm->arch.nested_mmus_size];
-		if (atomic_read(&mmu->refcnt))
+		if (atomic_read(&mmu->refcnt) || mmu->parked)
 			continue;
 
 		if (!kvm_s2_mmu_valid(mmu) || !mmu->accessed) {
@@ -1010,7 +1104,8 @@ static struct kvm_s2_mmu *get_s2_mmu_nested(struct kvm_vcpu *vcpu)
 
 	/* Every free MMU is in concurrent use: the pool is too small */
 	if (in_use && !READ_ONCE(kvm->arch.nested_mmus_no_grow) &&
-	    kvm->arch.nested_mmus_size < S2_MMU_MAX_PER_VM &&
+	    (kvm->arch.nested_mmus_size < S2_MMU_MAX_PER_VM ||
+	     kvm->arch.nested_mmus_parked) &&
 	    nested_s2_mmus_budget_left()) {
 		WRITE_ONCE(kvm->arch.nested_mmus_grow, true);
 		kvm_make_request(KVM_REQ_NESTED_S2_GROW, vcpu);

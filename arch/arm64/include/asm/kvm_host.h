@@ -330,6 +330,15 @@ struct kvm_s2_mmu {
 	bool	accessed;
 
 	/*
+	 * Added by growing the pool, and returned to the host budget by
+	 * parking it (invalid and unmapped) once unused. A parked MMU is
+	 * never picked by the victim search until a grow reactivates it.
+	 * Both under mmu_lock.
+	 */
+	bool	grown;
+	bool	parked;
+
+	/*
 	 *  0: Nobody is currently using this, check vttbr for validity
 	 * >0: Somebody is actively using this.
 	 */
@@ -441,8 +450,10 @@ struct kvm_arch {
 	size_t nested_mmus_size;
 	size_t nested_mmus_capacity;
 	struct list_head nested_mmu_blocks;
-	/* Grown MMUs, counted in the host budget, under mmu_lock */
+	/* Grown MMUs not parked, counted in the host budget, under mmu_lock */
 	unsigned int nested_mmus_grown;
+	/* Parked MMUs, under mmu_lock */
+	unsigned int nested_mmus_parked;
 	int nested_mmus_next;
 	bool nested_mmus_grow;
 	bool nested_mmus_no_grow;
